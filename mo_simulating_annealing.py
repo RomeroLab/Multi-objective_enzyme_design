@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib.util
 import json
 import os
 import pickle
 import random
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 DATA_DIR = REPO_ROOT / "data" / "finetuned_esm2"
 MODELS_DIR = REPO_ROOT / "models"
 STRUCTURES_DIR = REPO_ROOT / "structures"
+UTILS_DIR = REPO_ROOT / "utils"
 SEQS_TO_SCORE_DIR = REPO_ROOT / "seqs_to_score"
 SOLUBLEMPNN_OUTPUT_DIR = REPO_ROOT / "outputs"
 
@@ -31,8 +33,39 @@ F85L_PARENT = (
 )
 
 OBJECTIVES = ("esm2", "vae", "solublempnn")
-DEFAULT_STEPS = {3: 30000, 5: 35000}
 DEFAULT_MUTATION_RATES = {3: 1, 5: 2}
+
+MULTI_OBJECTIVE_DEFAULTS = {
+    "models": "all_models",
+    "start_temp": -0.5,
+    "final_temp": -2.25,
+    "nsteps": 30000,
+    "num_trials": 10,
+}
+
+CALIBRATION_DEFAULTS = {
+    "esm2": {
+        "models": "ESM2_rxn_rate_1_only",
+        "start_temp": -0.5,
+        "final_temp": -2.25,
+        "nsteps": 100000,
+        "num_trials": 1,
+    },
+    "solublempnn": {
+        "models": "SolubleMPNN_only",
+        "start_temp": -2.5,
+        "final_temp": -5.0,
+        "nsteps": 40000,
+        "num_trials": 1,
+    },
+    "vae": {
+        "models": "VAE_only",
+        "start_temp": -0.00000005,
+        "final_temp": -0.000025,
+        "nsteps": 200000,
+        "num_trials": 1,
+    },
+}
 
 
 @dataclass
@@ -51,6 +84,136 @@ class ESM2InferenceAdapter:
 
     def predict(self, sequences):
         return self.model.predict(sequences, self.embedding_type)
+
+
+class RepositoryScoreHandler:
+    """Score sequences using model and utility paths in this repository."""
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        models: LoadedModels,
+        trial: int,
+        objective: str | None,
+        bounds: dict[str, dict[str, float]] | None,
+    ) -> None:
+        self.args = args
+        self.trial = trial
+        self.bounds = bounds
+        self.esm2 = models.esm2 if objective in (None, "esm2") else None
+        self.vae = models.vae if objective in (None, "vae") else None
+        self.solublempnn = (
+            models.solublempnn if objective in (None, "solublempnn") else None
+        )
+
+    def _normalize(self, objective: str, score: float) -> float:
+        if self.bounds is None:
+            return score
+        lower = float(self.bounds[objective]["min"])
+        upper = float(self.bounds[objective]["max"])
+        return (score - lower) / (upper - lower)
+
+    def _score_solublempnn(self, sequence: str) -> float:
+        from utils.running_solublempnn import load_npz_scores
+
+        fasta_path = (
+            SEQS_TO_SCORE_DIR
+            / f"seq_{self.args.num_mut}_cuda{self.args.cuda_label}_v{self.trial}.fasta"
+        )
+        output_dir = SOLUBLEMPNN_OUTPUT_DIR / (
+            f"SimulatedAnnealing_scores_num_muts{self.args.num_mut}_"
+            f"assayW{self.args.assay_data_weight}_cuda{self.args.cuda_label}_"
+            f"v{self.trial}"
+        )
+        fasta_path.parent.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        fasta_path.write_text(f">seq\n{sequence}\n")
+
+        command = [
+            sys.executable,
+            str(UTILS_DIR / "protein_mpnn_run.py"),
+            "--path_to_fasta",
+            str(fasta_path),
+            "--pdb_path",
+            str(STRUCTURES_DIR / "4PVC.pdb1"),
+            "--pdb_path_chains",
+            "A B",
+            "--out_folder",
+            str(output_dir),
+            "--num_seq_per_target",
+            str(self.args.num_solublempnn_samples),
+            "--score_only",
+            "1",
+            "--seed",
+            "13",
+            "--batch_size",
+            "1",
+            "--path_to_model_weights",
+            str(MODELS_DIR / "solublempnn" / "soluble_model_weights"),
+            "--use_soluble_model",
+            "--save_score",
+            "1",
+        ]
+        subprocess.run(command, cwd=REPO_ROOT, check=True)
+        values = load_npz_scores(num_sequences=1, output_dir=str(output_dir))
+        if not values or values[0] is None:
+            raise RuntimeError(f"No SolubleMPNN score was produced in {output_dir}.")
+        return -float(values[0])
+
+    def seq2fitness(self, sequence: str):
+        import numpy as np
+        import torch
+        from utils.functions import compute_scores_from_batch
+
+        raw = {"esm2": None, "solublempnn": None, "vae": None}
+        if self.esm2 is not None:
+            raw["esm2"] = float(self.esm2.predict([sequence]).item())
+        if self.solublempnn is not None:
+            raw["solublempnn"] = self._score_solublempnn(sequence)
+        if self.vae is not None:
+            aa_to_index = {
+                amino_acid: index
+                for index, amino_acid in enumerate("ACDEFGHIKLMNPQRSTVWY-")
+            }
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            encoded = torch.tensor(
+                [[aa_to_index[amino_acid] for amino_acid in sequence]],
+                dtype=torch.long,
+                device=device,
+            )
+            raw["vae"] = -float(
+                compute_scores_from_batch(encoded, self.vae.to(device))
+                .detach()
+                .cpu()
+                .numpy()[0]
+            )
+
+        normalized = {
+            name: None if score is None else self._normalize(name, score)
+            for name, score in raw.items()
+        }
+        available = [score for score in normalized.values() if score is not None]
+        if len(available) == 3:
+            fitness = -float(
+                np.sqrt(
+                    self.args.assay_data_weight
+                    * (1 - normalized["esm2"]) ** 2
+                    + (1 - normalized["solublempnn"]) ** 2
+                    + (1 - normalized["vae"]) ** 2
+                )
+            )
+        elif len(available) == 1:
+            fitness = float(available[0])
+        else:
+            raise RuntimeError(
+                "Expected either one calibration objective or all three objectives."
+            )
+        return (
+            fitness,
+            normalized["esm2"],
+            normalized["solublempnn"],
+            normalized["vae"],
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,15 +251,27 @@ def parse_args() -> argparse.Namespace:
         help="Weight on the normalized ESM-2 reaction-rate objective.",
     )
     parser.add_argument("--num-solublempnn-samples", type=int, default=5)
-    parser.add_argument("--num-trials", type=int, default=10)
+    parser.add_argument(
+        "--num-trials",
+        type=int,
+        default=None,
+        help=(
+            "Defaults to 1 for calibration and 10 for multi-objective "
+            "optimization."
+        ),
+    )
     parser.add_argument(
         "--nsteps",
         type=int,
         default=None,
-        help="Defaults to 30,000 for 3 mutations and 35,000 for 5 mutations.",
+        help=(
+            "Defaults to 100,000 for ESM-2 calibration, 40,000 for "
+            "SolubleMPNN calibration, 200,000 for VAE calibration, and "
+            "30,000 for multi-objective optimization."
+        ),
     )
-    parser.add_argument("--start-temp", type=float, default=-0.5)
-    parser.add_argument("--final-temp", type=float, default=-2.25)
+    parser.add_argument("--start-temp", type=float, default=None)
+    parser.add_argument("--final-temp", type=float, default=None)
     parser.add_argument("--seed", type=int, default=3)
     parser.add_argument(
         "--cuda-label",
@@ -136,14 +311,34 @@ def resolve_cli(args: argparse.Namespace) -> argparse.Namespace:
     if args.mode != "calibrate" and args.objective is not None:
         raise ValueError("--objective is only valid with --mode calibrate.")
 
-    args.nsteps = args.nsteps or DEFAULT_STEPS[args.num_mut]
+    if args.mode == "calibrate":
+        defaults = CALIBRATION_DEFAULTS[args.objective]
+    elif args.mode == "optimize":
+        defaults = MULTI_OBJECTIVE_DEFAULTS
+    else:
+        defaults = None
+
+    if defaults is not None:
+        args.models = defaults["models"]
+        if args.start_temp is None:
+            args.start_temp = defaults["start_temp"]
+        if args.final_temp is None:
+            args.final_temp = defaults["final_temp"]
+        if args.nsteps is None:
+            args.nsteps = defaults["nsteps"]
+        if args.num_trials is None:
+            args.num_trials = defaults["num_trials"]
+    else:
+        args.models = "calibration_bounds"
+
     if args.smoke_test:
         args.num_trials = 1
         args.nsteps = 10
         args.num_solublempnn_samples = 1
 
     for name in ("num_trials", "nsteps", "num_solublempnn_samples"):
-        if getattr(args, name) <= 0:
+        value = getattr(args, name)
+        if value is not None and value <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive.")
     if args.assay_data_weight <= 0:
         raise ValueError("--assay-data-weight must be positive.")
@@ -183,12 +378,12 @@ def validate_required_paths() -> None:
         MODELS_DIR / "finetuned_ESM2_for_reaction_rate.pt",
         MODELS_DIR / "solublempnn" / "soluble_model_weights" / "v_48_020.pt",
         STRUCTURES_DIR / "4PVC.pdb1",
-        REPO_ROOT / "protein_mpnn_run.py",
+        UTILS_DIR / "protein_mpnn_run.py",
+        UTILS_DIR / "protein_mpnn_utils.py",
+        UTILS_DIR / "running_solublempnn.py",
+        UTILS_DIR / "simulated_annealing_utils.py",
     ]
     missing = [path for path in required if not path.is_file()]
-    if not (REPO_ROOT / "protein_mpnn_utils.py").is_file():
-        if importlib.util.find_spec("protein_mpnn_utils") is None:
-            missing.append(REPO_ROOT / "protein_mpnn_utils.py")
     if missing:
         paths = "\n".join(f"  - {path}" for path in missing)
         raise FileNotFoundError(f"Missing required annealing files:\n{paths}")
@@ -289,28 +484,12 @@ def make_score_handler(
     objective: str | None = None,
     bounds: dict[str, dict[str, float]] | None = None,
 ):
-    from utils.simulated_annealing_utils import seq2fitness_handler
-
-    esm2 = models.esm2 if objective in (None, "esm2") else None
-    vae = models.vae if objective in (None, "vae") else None
-    solublempnn = models.solublempnn if objective in (None, "solublempnn") else None
-
-    return seq2fitness_handler(
-        F85L_PARENT,
-        args.num_mut,
-        args.assay_data_weight,
-        args.num_solublempnn_samples,
-        esm2,
-        None if bounds is None else bounds["esm2"]["max"],
-        None if bounds is None else bounds["esm2"]["min"],
-        solublempnn,
-        None if bounds is None else bounds["solublempnn"]["max"],
-        None if bounds is None else bounds["solublempnn"]["min"],
-        vae,
-        None if bounds is None else bounds["vae"]["max"],
-        None if bounds is None else bounds["vae"]["min"],
-        args.cuda_label,
-        trial,
+    return RepositoryScoreHandler(
+        args=args,
+        models=models,
+        trial=trial,
+        objective=objective,
+        bounds=bounds,
     )
 
 
@@ -393,11 +572,17 @@ def save_trajectory(output_dir: Path, trial: int, optimizer) -> None:
 
 
 def calibration_dir(args: argparse.Namespace, objective: str) -> Path:
+    if args.smoke_test:
+        nsteps = 10
+    elif args.mode == "calibrate" and args.objective == objective:
+        nsteps = args.nsteps
+    else:
+        nsteps = CALIBRATION_DEFAULTS[objective]["nsteps"]
     return (
         args.calibration_root
         / f"{args.num_mut}mut"
         / objective
-        / f"{args.nsteps}steps"
+        / f"{nsteps}steps"
     )
 
 
@@ -436,8 +621,11 @@ def run_calibration(args: argparse.Namespace) -> None:
     best_trial = max(trials, key=lambda row: row["optimized_score"])
     summary = {
         "mode": "calibrate",
+        "models": args.models,
         "objective": args.objective,
         "num_mut": args.num_mut,
+        "start_temp": args.start_temp,
+        "final_temp": args.final_temp,
         "nsteps": args.nsteps,
         "num_trials": args.num_trials,
         "num_solublempnn_samples": args.num_solublempnn_samples,
@@ -451,17 +639,31 @@ def run_calibration(args: argparse.Namespace) -> None:
 def run_build_bounds(args: argparse.Namespace) -> None:
     representatives = {}
     source_summaries = {}
+    calibration_parameters = {}
     for objective in OBJECTIVES:
         path = calibration_dir(args, objective) / "summary.json"
         if not path.is_file():
             raise FileNotFoundError(
                 f"Missing {path}. Run --mode calibrate --objective {objective} "
-                "with the same --num-mut and --nsteps first."
+                "for the same --num-mut first."
             )
         with path.open() as handle:
             summary = json.load(handle)
         representatives[objective] = summary["best_trial"]["raw_scores"]
         source_summaries[objective] = str(path)
+        calibration_parameters[objective] = {
+            "models": summary.get(
+                "models", CALIBRATION_DEFAULTS[objective]["models"]
+            ),
+            "start_temp": summary.get(
+                "start_temp", CALIBRATION_DEFAULTS[objective]["start_temp"]
+            ),
+            "final_temp": summary.get(
+                "final_temp", CALIBRATION_DEFAULTS[objective]["final_temp"]
+            ),
+            "nsteps": summary["nsteps"],
+            "num_trials": summary["num_trials"],
+        }
 
     bounds = {}
     for score_name in OBJECTIVES:
@@ -481,7 +683,7 @@ def run_build_bounds(args: argparse.Namespace) -> None:
 
     payload = {
         "num_mut": args.num_mut,
-        "nsteps": args.nsteps,
+        "calibration_parameters": calibration_parameters,
         "method": (
             "For each model, max is its score on the representative obtained "
             "by optimizing that model; min is its lowest score among the two "
@@ -529,6 +731,7 @@ def run_multi_objective(args: argparse.Namespace) -> None:
         output_dir / "parameters.json",
         {
             "mode": "optimize",
+            "models": args.models,
             "num_mut": args.num_mut,
             "assay_data_weight": args.assay_data_weight,
             "num_solublempnn_samples": args.num_solublempnn_samples,
@@ -594,8 +797,11 @@ def main() -> None:
     os.chdir(REPO_ROOT)
     args = resolve_cli(parse_args())
     print(
-        f"mode={args.mode} num_mut={args.num_mut} nsteps={args.nsteps} "
-        f"num_trials={args.num_trials} assay_data_weight={args.assay_data_weight}"
+        f"Models: {args.models}\n"
+        f"mode={args.mode} num_mut={args.num_mut} "
+        f"start_temp={args.start_temp} final_temp={args.final_temp} "
+        f"nsteps={args.nsteps} num_trials={args.num_trials} "
+        f"assay_data_weight={args.assay_data_weight}"
     )
     if args.mode == "calibrate":
         run_calibration(args)
