@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Partially fine-tune ESM-2 to predict Gre2 initial reaction rate."
     )
-    parser.add_argument("--hparams", type=Path, default=Path("./models/training_finetuned_ESM2_for_reaction_rate/hparams.yaml"))
+    parser.add_argument("--hparams", type=Path, default=Path("models/training_finetuned_ESM2_for_reaction_rate/hparams.yaml"))
     parser.add_argument(
         "--data-dir",
         type=Path,

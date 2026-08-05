@@ -48,9 +48,9 @@ DEFAULT_DATA_DIR = Path("data/finetuned_esm2")
 # to CreiLOV, all-token embeddings, and seed 3. All other model and optimizer
 # hyperparameters are shared between the subset and 0thru5 runs.
 SUBSET_TRAINING_HPARAMS = {
-    "epochs": 1000,
+    "epochs": 2000,
     "patience": 400,
-    "batch_size": 32,
+    "batch_size": 16,
 }
 
 ZERO_TO_FIVE_TRAINING_HPARAMS = {
@@ -89,14 +89,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=None,
+        default=16,
         help="Override the dataset-specific batch size.",
     )
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--num-lora-layers", type=int, default=27)
     parser.add_argument("--lora-lr", type=float, default=1e-6)
     parser.add_argument("--head-lr", type=float, default=1e-5)
-    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.005)
     parser.add_argument("--l1-lambda", type=float, default=1e-7)
     parser.add_argument("--bottleneck", type=int, default=640)
     parser.add_argument("--hidden", type=int, default=64)
