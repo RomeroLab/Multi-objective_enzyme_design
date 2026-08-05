@@ -17,6 +17,8 @@ notebooks/*
 
 # ignore finetuned esm2 (3.3 GBs)
 finetuned_ESM2_for_reaction_rate.pt
+*.pt
+*.ckpt
 
 # Distribution / packaging
 .Python
