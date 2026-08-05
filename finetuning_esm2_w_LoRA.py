@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import pickle
 import random
 from pathlib import Path
 from typing import Optional
@@ -25,26 +27,71 @@ CREILOV_WT = (
     "DGTPFWNLLTVTPIKTPDGRVSKFVGVQVDVTSKTEGKALA"
 )
 
+PROTEIN_NAME = "CreiLOV"
+EMBEDDING_TYPE = "all_tokens"
+TRAINING_SEED = 3
+
 DEFAULT_DATASETS = [
     "subset_single_CreiLOV_mutants",
     "subset_double_CreiLOV_mutants",
     "subset_triple_CreiLOV_mutants",
     "subset_quadruple_CreiLOV_mutants",
     "subset_five_CreiLOV_mutants",
-    "0thru5_CreiLOV_mutants",
+    "dataset_df_for_0thru5_CreiLOV_mutants",
+    # download additional datasets from https://huggingface.co/datasets/RomeroLab-Duke/protein-fitness-datasets-for-benchmarking-ft-esm2-strategies
 ]
 
+DEFAULT_DATA_DIR = Path("data/finetuned_esm2")
+
+# Dataset-specific training schedules from
+# Finetuning_ESM2_w_lora_and_linear_head.py. This reproduction is restricted
+# to CreiLOV, all-token embeddings, and seed 3. All other model and optimizer
+# hyperparameters are shared between the subset and 0thru5 runs.
+SUBSET_TRAINING_HPARAMS = {
+    "epochs": 1000,
+    "patience": 400,
+    "batch_size": 32,
+}
+
+ZERO_TO_FIVE_TRAINING_HPARAMS = {
+    "epochs": 500,
+    "patience": 500,
+    "batch_size": 32,
+}
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fine-tune ESM-2 LoRA models on CreiLOV residue-level embeddings.")
-    parser.add_argument("--data-dir", type=Path, default=Path("."))
-    parser.add_argument("--output-dir", type=Path, default=Path("logs"))
+    parser = argparse.ArgumentParser(
+        description="Fine-tune ESM-2 with LoRA on all-token CreiLOV representations."
+    )
+    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--output-dir", type=Path, default=Path("logs/lora"))
     parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS)
-    parser.add_argument("--test-set", default="test_CreiLOV_mutants.pkl")
-    parser.add_argument("--seeds", nargs="+", type=int, default=[3, 7028, 88])
+    parser.add_argument("--test-set", default="test_CreiLOV_mutants.csv")
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=5,
+        help="Seed used once to create the fixed 90/10 train/validation split.",
+    )
     parser.add_argument("--model", default="esm2_t33_650M_UR50D")
-    parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--patience", type=int, default=500)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override the dataset-specific number of training epochs.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=None,
+        help="Override the dataset-specific early-stopping patience.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override the dataset-specific batch size.",
+    )
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--num-lora-layers", type=int, default=27)
     parser.add_argument("--lora-lr", type=float, default=1e-6)
@@ -96,6 +143,139 @@ def detect_sequence_col(df: pd.DataFrame) -> str:
     if "sequence" in df.columns:
         return "sequence"
     raise KeyError("Expected a 'Sequence' or 'sequence' column.")
+
+
+def resolve_table_path(data_dir: Path, name: str) -> Path:
+    """Resolve an explicit filename or a dataset stem within data_dir."""
+    supplied = Path(name)
+    candidates = [supplied] if supplied.suffix else [
+        supplied.with_suffix(".csv"),
+        supplied.with_suffix(".pkl"),
+    ]
+    for candidate in candidates:
+        path = candidate if candidate.is_absolute() else data_dir / candidate
+        if path.exists():
+            return path
+    checked = ", ".join(str(data_dir / candidate) for candidate in candidates)
+    raise FileNotFoundError(f"Dataset not found. Checked: {checked}")
+
+
+def load_table(path: Path, label_col: str) -> pd.DataFrame:
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path)
+    elif path.suffix.lower() in {".pkl", ".pickle"}:
+        df = pd.read_pickle(path)
+    else:
+        raise ValueError(f"Unsupported dataset format: {path.suffix}")
+
+    sequence_col = detect_sequence_col(df)
+    if label_col not in df.columns:
+        raise KeyError(f"{path} does not contain label column {label_col!r}.")
+    if df[sequence_col].isna().any() or df[label_col].isna().any():
+        raise ValueError(
+            f"{path} contains missing values in {sequence_col!r} or {label_col!r}."
+        )
+    return df.reset_index(drop=True)
+
+
+def resolve_training_hparams(
+    args: argparse.Namespace,
+    dataset_path: Path,
+) -> dict[str, int | str]:
+    """Return the deposited training schedule for the selected dataset."""
+    dataset_name = dataset_path.stem.casefold()
+    if "0thru5_creilov_mutants" in dataset_name:
+        hparams = ZERO_TO_FIVE_TRAINING_HPARAMS.copy()
+        dataset_regime = "0thru5"
+    elif dataset_name.startswith("subset_") and "creilov_mutants" in dataset_name:
+        hparams = SUBSET_TRAINING_HPARAMS.copy()
+        dataset_regime = "subset"
+    else:
+        raise ValueError(
+            "Could not determine the CreiLOV training regime from "
+            f"{dataset_path.name!r}. Expected a subset_*_CreiLOV_mutants or "
+            "dataset_df_for_0thru5_CreiLOV_mutants dataset."
+        )
+
+    for key, override in (
+        ("epochs", args.epochs),
+        ("patience", args.patience),
+        ("batch_size", args.batch_size),
+    ):
+        if override is not None:
+            if override <= 0:
+                raise ValueError(f"--{key.replace('_', '-')} must be positive.")
+            hparams[key] = int(override)
+
+    hparams["dataset_regime"] = dataset_regime
+    return hparams
+
+
+def save_run_hparams(
+    log_dir: Path,
+    args: argparse.Namespace,
+    dataset_path: Path,
+    seed: int,
+    training_hparams: dict[str, int | str],
+) -> None:
+    """Record the complete effective configuration for reproducibility."""
+    hparams = {
+        "dataset": str(dataset_path),
+        "dataset_regime": training_hparams["dataset_regime"],
+        "protein": PROTEIN_NAME,
+        "embedding_type": EMBEDDING_TYPE,
+        "seed": seed,
+        "split_seed": args.split_seed,
+        "model": args.model,
+        "epochs": training_hparams["epochs"],
+        "patience": training_hparams["patience"],
+        "batch_size": training_hparams["batch_size"],
+        "num_lora_layers": args.num_lora_layers,
+        "lora_learning_rate": args.lora_lr,
+        "regression_head_learning_rate": args.head_lr,
+        "weight_decay": args.weight_decay,
+        "l1_lambda": args.l1_lambda,
+        "bottleneck": args.bottleneck,
+        "hidden": args.hidden,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "head_dropout": args.head_dropout,
+        "label_column": args.label_col,
+    }
+    with (log_dir / "effective_hparams.json").open("w") as handle:
+        json.dump(hparams, handle, indent=2)
+
+
+def prepare_data_module_files(
+    df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    dataset_name: str,
+    output_dir: Path,
+    split_seed: int,
+) -> tuple[Path, Path]:
+    """Create stable split indices and a pickle required by the data module."""
+    cache_dir = output_dir / "prepared_splits"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    splits_path = cache_dir / f"{dataset_name}_split_seed_{split_seed}.pkl"
+    if not splits_path.exists():
+        shuffled_indices = (
+            df.sample(frac=1, random_state=split_seed).index.to_list()
+        )
+        train_size = int(0.9 * len(shuffled_indices))
+        if train_size == 0 or train_size == len(shuffled_indices):
+            raise ValueError(
+                f"{dataset_name} needs at least two rows for a train/validation split."
+            )
+        train_indices = shuffled_indices[:train_size]
+        val_indices = shuffled_indices[train_size:]
+        with splits_path.open("wb") as handle:
+            pickle.dump((train_indices, val_indices), handle)
+
+    test_pickle_path = cache_dir / "test_CreiLOV_mutants.pkl"
+    test_df.to_pickle(test_pickle_path)
+    return splits_path, test_pickle_path
 
 
 def predict_dataframe(
@@ -194,16 +374,25 @@ def summarize_metrics(pred_df: pd.DataFrame, log_dir: Path) -> None:
 
 def run_one_dataset(args: argparse.Namespace, dataset_name: str, seed: int, tokenizer: AutoTokenizer) -> None:
     set_seed(seed)
-    data_path = args.data_dir / f"{dataset_name}.pkl"
-    splits_path = args.data_dir / f"{dataset_name}_splits.pkl"
-    test_path = args.data_dir / args.test_set
+    data_path = resolve_table_path(args.data_dir, dataset_name)
+    training_hparams = resolve_training_hparams(args, data_path)
+    batch_size = training_hparams["batch_size"]
+    test_path = resolve_table_path(args.data_dir, args.test_set)
+    df = load_table(data_path, args.label_col)
+    test_df = load_table(test_path, args.label_col)
+    splits_path, test_pickle_path = prepare_data_module_files(
+        df=df,
+        test_df=test_df,
+        dataset_name=data_path.stem,
+        output_dir=args.output_dir,
+        split_seed=args.split_seed,
+    )
 
-    df = pd.read_pickle(data_path).reset_index(drop=True)
     dm = SequenceFunctionDataModule(
         data_frame=df,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         splits_path=str(splits_path),
-        test_set_path=str(test_path),
+        test_set_path=str(test_pickle_path),
         seed=seed,
         num_workers=args.num_workers,
     )
@@ -225,19 +414,32 @@ def run_one_dataset(args: argparse.Namespace, dataset_name: str, seed: int, toke
         head_dropout=args.head_dropout,
     )
 
-    run_name = f"lora_residue_esm2_{dataset_name}_seed_{seed}"
+    run_name = f"lora_all_tokens_esm2_{data_path.stem}_seed_{seed}"
     logger = CSVLogger(save_dir=str(args.output_dir), name=run_name)
+    log_dir = Path(logger.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    save_run_hparams(log_dir, args, data_path, seed, training_hparams)
     checkpoint = ModelCheckpoint(
-        dirpath=Path(logger.log_dir),
+        dirpath=log_dir,
         monitor="val_reg_loss",
         mode="min",
         save_top_k=1,
         save_last=True,
     )
-    early_stop = EarlyStopping(monitor="val_reg_loss", mode="min", patience=args.patience)
+    early_stop = EarlyStopping(
+        monitor="val_reg_loss",
+        mode="min",
+        patience=training_hparams["patience"],
+    )
+
+    print(
+        f"{data_path.name}: regime={training_hparams['dataset_regime']}, "
+        f"epochs={training_hparams['epochs']}, "
+        f"patience={training_hparams['patience']}, batch_size={batch_size}"
+    )
 
     trainer = pl.Trainer(
-        max_epochs=args.epochs,
+        max_epochs=training_hparams["epochs"],
         logger=logger,
         callbacks=[checkpoint, early_stop],
         accelerator="auto",
@@ -249,7 +451,6 @@ def run_one_dataset(args: argparse.Namespace, dataset_name: str, seed: int, toke
     trainer.fit(model, dm)
     logger.finalize("success")
 
-    log_dir = Path(logger.log_dir)
     best_path = checkpoint.best_model_path or checkpoint.last_model_path
     if best_path:
         model = ESM2LoRAResidueRegressor.load_from_checkpoint(best_path, tokenizer=tokenizer)
@@ -258,13 +459,11 @@ def run_one_dataset(args: argparse.Namespace, dataset_name: str, seed: int, toke
 
     train_df = df.iloc[dm.train_idx].copy()
     val_df = df.iloc[dm.val_idx].copy()
-    test_df = pd.read_pickle(test_path).reset_index(drop=True)
-
     pred_df = pd.concat(
         [
-            predict_dataframe(model, train_df, args.label_col, args.batch_size, "train"),
-            predict_dataframe(model, val_df, args.label_col, args.batch_size, "val"),
-            predict_dataframe(model, test_df, args.label_col, args.batch_size, "test"),
+            predict_dataframe(model, train_df, args.label_col, batch_size, "train"),
+            predict_dataframe(model, val_df, args.label_col, batch_size, "val"),
+            predict_dataframe(model, test_df, args.label_col, batch_size, "test"),
         ],
         ignore_index=True,
     )
@@ -280,8 +479,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(f"facebook/{args.model}")
     for dataset_name in args.datasets:
-        for seed in args.seeds:
-            run_one_dataset(args, dataset_name, seed, tokenizer)
+        run_one_dataset(args, dataset_name, TRAINING_SEED, tokenizer)
 
 
 if __name__ == "__main__":
