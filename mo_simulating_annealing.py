@@ -17,18 +17,32 @@ import random
 import pickle
 import csv
 import subprocess
+import importlib.util
+from pathlib import Path
 from coral_pytorch.dataset import corn_label_from_logits
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
 # import models
-from models.convVAE import (get_msa_from_fasta, ProtDataModule, ConvVAE)
-from models.ESM2_w_regression_MLP_head import (finetuning_ESM2_with_mse_loss)
+from models.ConvVAE import (get_msa_from_fasta, ProtDataModule, ConvVAE)
+from models.partial_esm2_ft_w_MLP import (finetuning_ESM2_with_mse_loss)
 
 # import helper functions
 from utils.functions import (compute_scores_from_batch, convert_fasta_msa_to_dataframe, score_sequences_with_vae_mutant_marginal)
 from utils.running_solublempnn import (load_fasta_with_names, write_fasta, parse_fasta, load_npz_scores)
 from utils.simulated_annealing_utils import (get_non_gap_indices, generate_all_point_mutants, mut2seq, find_top_n_mutations,
     generate_random_mut_non_gap_indices, SA_optimizer, seq2fitness_handler)
+
+# Resolve all repository paths relative to this script. The helper utilities
+# invoke protein_mpnn_run.py with repository-relative paths, so use the
+# repository root as the working directory regardless of where this script is
+# launched from.
+REPO_ROOT = Path(__file__).resolve().parent
+DATA_DIR = REPO_ROOT / "data" / "finetuned_esm2"
+MODELS_DIR = REPO_ROOT / "models"
+STRUCTURES_DIR = REPO_ROOT / "structures"
+SEQS_TO_SCORE_DIR = REPO_ROOT / "seqs_to_score"
+OUTPUTS_DIR = REPO_ROOT / "outputs"
+os.chdir(REPO_ROOT)
 
 # basic parameters
 AAs = 'ACDEFGHIKLMNPQRSTVWY-' # setup torchtext vocab to map AAs to indices, usage is aa2ind(list(AAsequence))
@@ -62,6 +76,37 @@ seed = random.randint(0, 100000) # Set random seeds for reproducibility
 random.seed(seed)
 np.random.seed(seed)
 
+
+def validate_required_paths():
+    required_paths = []
+    if use_VAE:
+        required_paths.append(MODELS_DIR / "Best_ConvVAE.ckpt")
+    if use_ESM2:
+        required_paths.extend([
+            DATA_DIR / "normalized_processed_BI_R1_dataset_w_quantiles.pkl",
+            MODELS_DIR / "finetuned_ESM2_for_reaction_rate.pt",
+        ])
+    if use_SolubleMPNN:
+        required_paths.extend([
+            STRUCTURES_DIR / "4PVC.pdb1",
+            MODELS_DIR / "solublempnn" / "soluble_model_weights" / "v_48_020.pt",
+            REPO_ROOT / "protein_mpnn_run.py",
+        ])
+
+    missing = [path for path in required_paths if not path.is_file()]
+    if use_SolubleMPNN and not (REPO_ROOT / "protein_mpnn_utils.py").is_file():
+        if importlib.util.find_spec("protein_mpnn_utils") is None:
+            missing.append(REPO_ROOT / "protein_mpnn_utils.py")
+    if missing:
+        formatted = "\n".join(f"  - {path}" for path in missing)
+        raise FileNotFoundError(f"Missing required annealing files:\n{formatted}")
+
+
+validate_required_paths()
+SEQS_TO_SCORE_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 # VAE parameters
 if use_VAE:
     batch_size = 16
@@ -75,22 +120,21 @@ if use_VAE:
     factor_3 = 1
     dim_4 = 400
     VAE = ConvVAE(slen, ks, nlatent, learning_rate, epochs, n_cycle, factor_2, factor_3, dim_4)
-    checkpoint = torch.load('./models/Best_ConvVAE.ckpt', map_location='cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load(MODELS_DIR / 'Best_ConvVAE.ckpt', map_location=device)
     state_dict = checkpoint['state_dict']  # Extract only the state_dict
     state_dict = {k.replace('model.', ''): v for k, v in state_dict.items()}
     VAE.load_state_dict(state_dict)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     VAE.to(device)
 else:
     VAE = None
 
 # ESM2 parameters
 if use_ESM2:
-    data_filepath = 'normalized_processed_BI_R1_dataset_w_quantiles.pkl'
+    data_filepath = DATA_DIR / 'normalized_processed_BI_R1_dataset_w_quantiles.pkl'
     label = 'Quantile_Rxn_Rate_at_0.05mgml' # ESM2 finetuned to predict reaction rate at 0.05 mg/ml
     version = 1
-    filepath = f'finetuning_ESM2_with_{data_filepath}_for_{label}' 
-    checkpoint_path = f'./models/finetuned_ESM2_for_reaction_rate.pt'
+    filepath = f'finetuning_ESM2_with_{data_filepath.name}_for_{label}'
+    checkpoint_path = MODELS_DIR / 'finetuned_ESM2_for_reaction_rate.pt'
     huggingface_identifier ='esm2_t33_650M_UR50D'
     ESM2 = AutoModelForMaskedLM.from_pretrained(f"facebook/{huggingface_identifier}")
     tokenizer = AutoTokenizer.from_pretrained(f"facebook/{huggingface_identifier}")
@@ -123,9 +167,10 @@ if use_ESM2:
                      learning_rate, lr_mult, lr_mult_factor,
                      WD, reinit_optimizer, grad_clip_threshold, use_scheduler, warm_restart,
                      slen, reg_weights, num_reg_tasks, reg_run_name,
-                     using_EMA, decay, epoch_threshold_to_unlock_ESM2, WT, data_filepath)
-    checkpoint = torch.load(checkpoint_path)
+                     using_EMA, decay, epoch_threshold_to_unlock_ESM2, WT, str(data_filepath))
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     ESM2_rxn_rate_1.load_state_dict(checkpoint)
+    ESM2_rxn_rate_1.to(device)
     ESM2_rxn_rate_1.eval()
 else:
     ESM2_rxn_rate_1 = None
@@ -170,11 +215,9 @@ if num_mut == 5:
     nsteps = 35000 # ! update
 
 # create directories to save results
-if not os.path.exists(f'{run_name}'):
-    os.makedirs(f'{run_name}')
-dir_path = f'{run_name}/{num_mut}mut_{models}_{nsteps}steps'
-if not os.path.exists(dir_path):
-    os.makedirs(dir_path)
+run_dir = REPO_ROOT / run_name
+dir_path = run_dir / f'{num_mut}mut_{models}_{nsteps}steps'
+dir_path.mkdir(parents=True, exist_ok=True)
 
 # Saving parameters
 params_str = f"""################################################
@@ -200,7 +243,7 @@ Simulated Annealing Parameters
 """
 
 # save parameters text file
-file_path = os.path.join(dir_path, f"parameters_{num_mut}mut_assayW{assay_data_weight}_cuda{cuda_num}.txt")
+file_path = dir_path / f"parameters_{num_mut}mut_assayW{assay_data_weight}_cuda{cuda_num}.txt"
 with open(file_path, "w") as file:
     file.write(params_str)
 print(f"Parameters saved to {file_path}")
@@ -208,12 +251,12 @@ print(f"Parameters saved to {file_path}")
 # Running Simulated annealing
 for i in range(num_trials):
     # Set the file names with version numbers
-    best_mutant_file = f"{dir_path}/best_{run_name}_{num_mut}mut_start_pos{start_position}_{models}_assayW{assay_data_weight}_cuda{cuda_num}_v{i}.pickle"
-    trajectory_file = f"{dir_path}/traj_{run_name}_{num_mut}mut_start_pos{start_position}_{models}_assayW{assay_data_weight}_cuda{cuda_num}_v{i}.png"
-    csv_filename = f"{dir_path}/fitness_trajectory_{run_name}_{num_mut}mut_start_pos{start_position}_{models}_assayW{assay_data_weight}_cuda{cuda_num}_v{i}.csv"
+    best_mutant_file = dir_path / f"best_{run_name}_{num_mut}mut_start_pos{start_position}_{models}_assayW{assay_data_weight}_cuda{cuda_num}_v{i}.pickle"
+    trajectory_file = dir_path / f"traj_{run_name}_{num_mut}mut_start_pos{start_position}_{models}_assayW{assay_data_weight}_cuda{cuda_num}_v{i}.png"
+    csv_filename = dir_path / f"fitness_trajectory_{run_name}_{num_mut}mut_start_pos{start_position}_{models}_assayW{assay_data_weight}_cuda{cuda_num}_v{i}.csv"
 
     # Create an instance of seq_fitness class with WT
-    path_to_fasta=f"./seqs_to_score/seq_{num_mut}_assayW{assay_data_weight}_cuda{cuda_num}_v{i}.fasta"
+    path_to_fasta = SEQS_TO_SCORE_DIR / f"seq_{num_mut}_assayW{assay_data_weight}_cuda{cuda_num}_v{i}.fasta"
     with open(path_to_fasta, "w") as fasta_file:
                     fasta_file.write(">seq\n")
                     fasta_file.write(WT + "\n")
@@ -247,8 +290,8 @@ for i in range(num_trials):
         pickle.dump((best_mut), f)
 
     # Save sequences along trajectory
-    close_sequences_file = (
-        f"{dir_path}/close_sequences_{run_name}_{num_mut}mut_start_pos{start_position}_"
+    close_sequences_file = dir_path / (
+        f"close_sequences_{run_name}_{num_mut}mut_start_pos{start_position}_"
         f"{models}_assayW{assay_data_weight}_cuda{cuda_num}_v{i}.pickle"
     )
     with open(close_sequences_file, "wb") as f:
@@ -264,8 +307,6 @@ for i in range(num_trials):
             writer.writerow({'Step': step, 'Fitness': float(fitness)})
 
     # Save Plotted Trajectory
-    sa_optimizer.plot_trajectory(savefig_name=trajectory_file)
-
-
+    sa_optimizer.plot_trajectory(savefig_name=str(trajectory_file))
 
 
