@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-# coding: utf-8
+"""Partially fine-tune ESM-2 to predict Gre2 initial reaction rate."""
 
-# import packages
+from __future__ import annotations
+
+import argparse
 import os
 import random
-from collections import OrderedDict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -12,15 +13,13 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
 from scipy.stats import spearmanr
-from sklearn import metrics
-from torchtext import vocab
+from sklearn.metrics import mean_squared_error
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-from models.partial_esm2_ft_w_MLP import ProtDataModule, finetuning_ESM2_with_mse_loss
-from utils.functions import calculate_median_regression_values
+from models.partial_esm2_ft_w_MLP import (ProtDataModule, finetuning_ESM2_with_mse_loss)
 
 # load preprocessed Gre2 data
 data_path = Path("./data/finetuned_esm2/normalized_processed_BI_R1_dataset_w_quantiles")
