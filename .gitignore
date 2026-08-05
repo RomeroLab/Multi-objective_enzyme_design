@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# ignore mac OS files
+*DS_Store
+
 # ignore log files
 *out
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Partially fine-tune ESM-2 to predict Gre2 initial reaction rate."""
+"""Partially fine-tune ESM-2 on Gre2 using hyperparameters from YAML."""
 
 from __future__ import annotations
 
@@ -13,51 +13,99 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
+import yaml
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
 from scipy.stats import spearmanr
 from sklearn.metrics import mean_squared_error
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-from models.partial_esm2_ft_w_MLP import (ProtDataModule, finetuning_ESM2_with_mse_loss)
+from models.partial_esm2_ft_w_MLP import (
+    ProtDataModule,
+    finetuning_ESM2_with_mse_loss,
+)
 
 
-GRE2_WT = ("MSVFVSGANGFIAQHIVDLLLKEDYKVIGSARSQEKAENLTEAFGNNPKFSMEVVPDISKLDAFDHVFQKHGKDIKIVLHTASPFCFDITDSERDLLIPAVNGVKGILHSIKKYAADSVERVVLTSSYAAVFDMAKENDKSLTFNEESWNPATWESCQSDPVNAYCGSKKFAEKAAWEFLEENRDSVKFELTAVNPVYVFGPQMFDKDVKKHLNTSCELVNSLMHLSPEDKIPELFGGYIDVRDVAKAHLVAFQKRETIGQRLIVSEARFTMQDVLDILNEDFPVLKGNIPVGKPGSGATHNTLGATLDNKKSKKLLGFKFRNLKETIDDTASQILKFEGRI")
 LABEL_COLUMN = "Quantile Rxn Rate at 0.05mgml"
-MODEL_ID = "esm2_t33_650M_UR50D"
 TOKEN_FORMAT = "ESM2"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Partially fine-tune ESM-2 650M on the Gre2 dataset."
+        description="Partially fine-tune ESM-2 to predict Gre2 initial reaction rate."
     )
+    parser.add_argument("--hparams", type=Path, default=Path("hparams.yaml"))
     parser.add_argument(
-        "--data",
+        "--data-dir",
         type=Path,
-        default=Path(
-            "data/finetuned_esm2/"
-            "normalized_processed_BI_R1_dataset_w_quantiles.pkl"
-        ),
+        default=Path("data/finetuned_esm2"),
     )
-    parser.add_argument(
-        "--splits",
-        type=Path,
-        default=Path(
-            "data/finetuned_esm2/"
-            "normalized_processed_BI_R1_dataset_w_quantiles_data_splits.pkl"
-        ),
-    )
+    parser.add_argument("--data", type=Path, default=None)
+    parser.add_argument("--splits", type=Path, default=None)
     parser.add_argument("--log-dir", type=Path, default=Path("logs"))
     parser.add_argument(
         "--model-output",
         type=Path,
         default=Path("models/finetuned_ESM2_for_reaction_rate.pt"),
     )
-    parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--seed", type=int, default=3)
     return parser.parse_args()
+
+
+def load_hparams(path: Path) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(f"Hyperparameter file not found: {path}")
+    with path.open() as handle:
+        hparams = yaml.safe_load(handle)
+
+    required = {
+        "WD",
+        "WT",
+        "batch_size",
+        "data_filepath",
+        "decay",
+        "embedding_type",
+        "epoch_threshold_to_unlock_ESM2",
+        "epochs",
+        "grad_clip_threshold",
+        "huggingface_identifier",
+        "learning_rate",
+        "lr_mult",
+        "lr_mult_factor",
+        "max_num_layers_unfreeze_each_epoch",
+        "num_layers_unfreeze_each_epoch",
+        "num_reg_tasks",
+        "num_unfrozen_layers",
+        "reg_weights",
+        "seed",
+        "slen",
+        "use_scheduler",
+        "using_EMA",
+        "warm_restart",
+    }
+    missing = required.difference(hparams)
+    if missing:
+        raise KeyError(f"hparams.yaml is missing keys: {sorted(missing)}")
+    if hparams["embedding_type"] not in {
+        "all_tokens",
+        "cls_token_only",
+        "mean_pooling",
+    }:
+        raise ValueError(
+            "EMA fine-tuning requires all_tokens, cls_token_only, or mean_pooling"
+        )
+    if int(hparams["using_EMA"]) != 1:
+        raise ValueError("using_EMA must equal 1 because only an EMA model is saved")
+    if int(hparams["slen"]) != len(hparams["WT"]):
+        raise ValueError("slen does not match the WT sequence length")
+    return hparams
+
+
+def resolve_paths(args: argparse.Namespace, hparams: dict) -> tuple[Path, Path]:
+    data_path = args.data or args.data_dir / hparams["data_filepath"]
+    splits_path = args.splits or data_path.with_name(
+        f"{data_path.stem}_data_splits.pkl"
+    )
+    return data_path, splits_path
 
 
 def set_seed(seed: int) -> None:
@@ -79,7 +127,7 @@ def load_dataframe(path: Path) -> pd.DataFrame:
     elif path.suffix == ".csv":
         df = pd.read_csv(path)
     else:
-        raise ValueError("--data must be a .pkl or .csv file")
+        raise ValueError("Training data must be a .pkl or .csv file")
 
     missing = {"Sequence", LABEL_COLUMN}.difference(df.columns)
     if missing:
@@ -89,70 +137,84 @@ def load_dataframe(path: Path) -> pd.DataFrame:
 
 def build_datamodule(
     df: pd.DataFrame,
-    batch_size: int,
+    hparams: dict,
     splits_path: Path,
-    seed: int,
 ) -> ProtDataModule:
     if not splits_path.exists():
         raise FileNotFoundError(f"Deposited split file not found: {splits_path}")
-
-    # Repository signature:
-    # ProtDataModule(data_frame, batch_size, token_format, splits_path, seed)
-    # The previous script reversed token_format and splits_path, so it tried to
-    # open "ESM2" as the split file.
     return ProtDataModule(
-        df,
-        batch_size,
-        TOKEN_FORMAT,
-        str(splits_path),
-        seed,
+        data_frame=df,
+        label_index=df.columns.get_loc(LABEL_COLUMN),
+        batch_size=int(hparams["batch_size"]),
+        splits_path=str(splits_path),
+        token_format=TOKEN_FORMAT,
+        seed=int(hparams["seed"]),
     )
 
 
 def build_model(
     esm2: torch.nn.Module,
     tokenizer: AutoTokenizer,
-    epochs: int,
-    batch_size: int,
-    seed: int,
+    hparams: dict,
+    data_path: Path,
 ) -> finetuning_ESM2_with_mse_loss:
+    # Keywords intentionally mirror the current model class signature.
     return finetuning_ESM2_with_mse_loss(
-        esm2,
-        MODEL_ID,
-        tokenizer,
-        27,       # num_unfrozen_layers
-        15,       # num_layers_unfreeze_each_epoch
-        36,       # max_num_layers_unfreeze_each_epoch
-        epochs,
-        batch_size,
-        seed,
-        1,        # cls_token_only
-        1e-5,     # learning_rate
-        1,        # lr_mult
-        1,        # lr_mult_factor
-        0.005,    # weight decay
-        0,        # reinitialize optimizer
-        3.0,      # gradient clipping threshold
-        1,        # use scheduler
-        1,        # use warm restart
-        len(GRE2_WT),
-        1,        # regression-task weight
-        1,        # number of regression tasks
-        1,        # use EMA
-        0.8,      # EMA decay
+        ESM2=esm2,
+        huggingface_identifier=hparams["huggingface_identifier"],
+        tokenizer=tokenizer,
+        num_unfrozen_layers=int(hparams["num_unfrozen_layers"]),
+        num_layers_unfreeze_each_epoch=int(
+            hparams["num_layers_unfreeze_each_epoch"]
+        ),
+        max_num_layers_unfreeze_each_epoch=int(
+            hparams["max_num_layers_unfreeze_each_epoch"]
+        ),
+        epochs=int(hparams["epochs"]),
+        batch_size=int(hparams["batch_size"]),
+        seed=int(hparams["seed"]),
+        embedding_type=hparams["embedding_type"],
+        learning_rate=float(hparams["learning_rate"]),
+        lr_mult=float(hparams["lr_mult"]),
+        lr_mult_factor=float(hparams["lr_mult_factor"]),
+        WD=float(hparams["WD"]),
+        grad_clip_threshold=float(hparams["grad_clip_threshold"]),
+        use_scheduler=int(hparams["use_scheduler"]),
+        warm_restart=int(hparams["warm_restart"]),
+        slen=int(hparams["slen"]),
+        reg_weights=hparams["reg_weights"],
+        num_reg_tasks=int(hparams["num_reg_tasks"]),
+        reg_type="mse",
+        using_EMA=int(hparams["using_EMA"]),
+        decay=float(hparams["decay"]),
+        epoch_threshold_to_unlock_ESM2=int(
+            hparams["epoch_threshold_to_unlock_ESM2"]
+        ),
+        WT=hparams["WT"],
+        data_filepath=str(data_path),
     )
 
-def predict(model: finetuning_ESM2_with_mse_loss, sequences: pd.Series) -> np.ndarray:
-    values = []
+
+def predict(
+    model: finetuning_ESM2_with_mse_loss,
+    sequences: pd.Series,
+    embedding_type: str,
+) -> np.ndarray:
+    predictions = []
     for sequence in sequences:
-        prediction = np.asarray(model.predict(sequence), dtype=float).reshape(-1)
-        values.append(float(np.median(prediction)))
-    return np.asarray(values)
+        value = np.asarray(
+            model.predict(sequence, embedding_type),
+            dtype=float,
+        ).reshape(-1)
+        predictions.append(float(np.median(value)))
+    return np.asarray(predictions)
+
 
 def save_evaluation(
     model: finetuning_ESM2_with_mse_loss,
     df: pd.DataFrame,
     dm: ProtDataModule,
+    embedding_type: str,
     output_dir: Path,
 ) -> None:
     rows = []
@@ -160,7 +222,7 @@ def save_evaluation(
     for split, indices in (("train", dm.train_idx), ("validation", dm.val_idx)):
         split_df = df.iloc[indices]
         actual = split_df[LABEL_COLUMN].to_numpy(dtype=float)
-        predicted = predict(model, split_df["Sequence"])
+        predicted = predict(model, split_df["Sequence"], embedding_type)
         rows.append(
             pd.DataFrame(
                 {
@@ -236,21 +298,28 @@ def save_loss_curve(output_dir: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    hparams = load_hparams(args.hparams)
+    data_path, splits_path = resolve_paths(args, hparams)
+    set_seed(int(hparams["seed"]))
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable. Run this script on a GPU node.")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Hyperparameters: {args.hparams}")
+    print(f"Training data: {data_path}")
+    print(f"Data splits: {splits_path}")
 
-    df = load_dataframe(args.data)
-    dm = build_datamodule(df, args.batch_size, args.splits, args.seed)
-    esm2 = AutoModelForMaskedLM.from_pretrained(f"facebook/{MODEL_ID}")
-    tokenizer = AutoTokenizer.from_pretrained(f"facebook/{MODEL_ID}")
-    model = build_model(esm2, tokenizer, args.epochs, args.batch_size, args.seed)
+    df = load_dataframe(data_path)
+    dm = build_datamodule(df, hparams, splits_path)
+    model_id = hparams["huggingface_identifier"]
+    esm2 = AutoModelForMaskedLM.from_pretrained(f"facebook/{model_id}")
+    tokenizer = AutoTokenizer.from_pretrained(f"facebook/{model_id}")
+    model = build_model(esm2, tokenizer, hparams, data_path)
 
     logger = CSVLogger(save_dir=str(args.log_dir), name="esm2")
     trainer = pl.Trainer(
         logger=logger,
-        max_epochs=args.epochs,
+        max_epochs=int(hparams["epochs"]),
         callbacks=[
             EarlyStopping(
                 monitor="val_reg_loss",
@@ -270,20 +339,30 @@ def main() -> None:
 
     ema = getattr(model, "ema", None)
     if ema is None:
-        raise AttributeError(
-            "The model has no 'ema' attribute; confirm that using_EMA=1."
-        )
+        raise AttributeError("EMA was not initialized by the fine-tuning model")
 
     args.model_output.parent.mkdir(parents=True, exist_ok=True)
     run_dir = Path(logger.log_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Apply EMA parameters for saving and evaluation. No non-EMA model or
-    # Lightning checkpoint is written.
-    with ema.average_parameters():
+    # The model's EMA tracks ESM-2 parameters. Apply them temporarily while
+    # saving and evaluating; the regression head remains at its trained values.
+    ema.to(model.device)
+    ema.store(model.ESM2_wo_lmhead.parameters())
+    try:
+        ema.copy_to(model.ESM2_wo_lmhead.parameters())
         torch.save(model.state_dict(), args.model_output)
         model.eval()
-        save_evaluation(model, df, dm, run_dir)
+        save_evaluation(
+            model,
+            df,
+            dm,
+            hparams["embedding_type"],
+            run_dir,
+        )
+    finally:
+        ema.restore(model.ESM2_wo_lmhead.parameters())
+        ema.to("cpu")
 
     save_loss_curve(run_dir)
     print(f"Saved EMA model: {args.model_output}")
