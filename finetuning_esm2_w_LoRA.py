@@ -258,7 +258,7 @@ def prepare_data_module_files(
     cache_dir = output_dir / "prepared_splits"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    splits_path = cache_dir / f"{dataset_name}_split_seed_{split_seed}.pkl"
+    splits_path = cache_dir / f"{dataset_name}_splits.pkl"
     if not splits_path.exists():
         shuffled_indices = (
             df.sample(frac=1, random_state=split_seed).index.to_list()
