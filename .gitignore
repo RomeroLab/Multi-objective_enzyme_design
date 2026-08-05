@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# notebook
+notebooks/*
+
 # ignore finetuned esm2 (3.3 GBs)
 finetuned_ESM2_for_reaction_rate.pt
 

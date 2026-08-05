@@ -208,7 +208,7 @@ class seq2fitness_handler:
 
         # Score with SolubleMPNN
         if self.SolubleMPNN is not None:
-            path_to_PDB="./structures/GRE2x2_AF3.pdb"
+            path_to_PDB="./structures/4PVC.pdb1"
             path_to_fasta=f"./seqs_to_score/seq_{self.num_mut}_v{self.version}.fasta" # Overwrite to avoid creating many files
             output_dir=f"./outputs/SimulatedAnnealing_scores_num_muts{self.num_mut}_assayW{self.assay_data_weight}_cuda{self.cuda_num}_v{self.version}"
             chains_to_design="A B"

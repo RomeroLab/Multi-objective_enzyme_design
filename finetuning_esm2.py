@@ -19,7 +19,7 @@ from sklearn import metrics
 from torchtext import vocab
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-from models.ESM2_w_regression_MLP_head import ProtDataModule, finetuning_ESM2_with_mse_loss
+from models.partial_esm2_ft_w_MLP import ProtDataModule, finetuning_ESM2_with_mse_loss
 from utils.functions import calculate_median_regression_values
 
 # load preprocessed Gre2 data

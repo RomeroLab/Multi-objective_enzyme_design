@@ -83,7 +83,7 @@ def get_chains_from_pdb(pdb_path):
     return sorted(chains)
 
 # Function to load and compute the mean of scores from .npz files
-def load_npz_scores(num_sequences, output_dir, base_name="GRE2x2_AF3_fasta_"):
+def load_npz_scores(num_sequences, output_dir, base_name="4PVC._fasta_"):
     """Load mean scores from all .npz files for the given number of sequences."""
     mean_scores = []
     for i in range(1, num_sequences + 1):
