@@ -54,9 +54,9 @@ SUBSET_TRAINING_HPARAMS = {
 }
 
 ZERO_TO_FIVE_TRAINING_HPARAMS = {
-    "epochs": 500,
+    "epochs": 2000,
     "patience": 500,
-    "batch_size": 32,
+    "batch_size": 16,
 }
 
 def parse_args() -> argparse.Namespace:
@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.005)
     parser.add_argument("--l1-lambda", type=float, default=1e-7)
     parser.add_argument("--bottleneck", type=int, default=640)
-    parser.add_argument("--hidden", type=int, default=64)
+    parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--lora-r", type=int, default=4)
     parser.add_argument("--lora-alpha", type=int, default=1)
     parser.add_argument("--lora-dropout", type=float, default=0.10)
