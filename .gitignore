@@ -20,6 +20,11 @@ finetuned_ESM2_for_reaction_rate.pt
 *.pt
 *.ckpt
 
+# ignore outputs from sa
+outputs/*
+seqs_to_score/*
+normalization_calibration/*
+
 # Distribution / packaging
 .Python
 build/
